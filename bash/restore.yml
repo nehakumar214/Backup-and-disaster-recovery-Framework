@@ -1,0 +1,494 @@
+
+trigger:
+  - none
+
+resources:
+  repositories:
+    - repository: Framework
+      type: git
+      name: DevOps/Framework
+
+    - repository: DevOps
+      type: git
+      name: DevOps
+      ref: main
+
+
+parameters:
+  - name: env_type
+    displayName: AWS Account the app is being deployed to
+    type: string
+    default: dev
+    values:
+      - dev
+      - demo
+      - prod
+  - name: aws_Region
+    displayName: The AWS region it is being deployed to
+    type: string
+    default: us-east-2
+  - name: Stack_Name
+    displayName: Name of the stack being validated
+    type: string
+  - name: customer_name
+    displayName: Customer Name
+    type: string
+  - name: owner_name
+    displayName: 'Owner Name'
+    type: string
+  - name: snapshot_arn
+    displayName: 'Snapshot ARN'
+    type: string
+  - name: allocated_storage
+    displayName: Allocated Storage
+    type: string
+    default: '100'
+  - name: Helm_Repo_URL
+    displayName: The Helm Chart Repo URL of the application where ther helm resides
+    type: string
+    default: <repo name>
+  - name: Helm_Chart_Version
+    displayName: The version of the helm chart of Application
+    type: string
+  - name: BCDR_Component
+    displayName: What do you want to restore?
+    type: string
+    default: rds
+    values:
+      - rds
+      - new_eks
+      - old_eks
+  
+  
+pool:
+  name: $(selected_pool)
+  demands:
+  - agent.os -equals Linux
+
+variables:
+  - group: sym_${{ parameters.env_type }}_cred
+  - name: awsRegion
+    value: ${{ parameters.aws_Region }}
+  - name: aws_account_number
+    ${{ if eq(parameters.env_type, 'dev') }}:
+      value: 12345
+    ${{ if eq(parameters.env_type, 'demo') }}:
+      value: 34567
+    ${{ if eq(parameters.env_type, 'prod') }}:
+      value: 7890
+  - name: aws_service_connection
+    ${{ if eq(parameters.env_type, 'dev') }}:
+      value: aws-dev-account-logisym
+    ${{ if eq(parameters.env_type, 'demo') }}:
+      value: aws-demo-account-logisym
+    ${{ if eq(parameters.env_type, 'prod') }}:
+      value: aws-prod-account-logisym
+  - name: stackName
+    value: ${{ parameters.Stack_Name }}
+  - name: customerName
+    value: ${{ parameters.customer_name }}
+  - name: ownerName
+    value: ${{ parameters.owner_name }}
+  - name: max_allocated_storage
+    value: $(( coalesce(variables['allocated_storage'], 0) + 100 ))
+  - name: allocated_storage
+    value: ${{ parameters.allocated_storage }}
+  - name: helm_chart_repo_url
+    value: ${{ parameters.Helm_Repo_URL }}
+  - name: helm_chart_version
+    value: ${{ parameters.Helm_Chart_Version }}
+  - name: snapshot_arn
+    value: ${{ parameters.snapshot_arn }}
+  - name: BCDR_Component
+    value: ${{ parameters.BCDR_Component }}
+  - name: aws_service_connection
+    ${{ if eq(parameters.env_type,'dev') }}:
+      value: aws-dev
+    ${{ if eq(parameters.env_type,'demo') }}:
+      value: aws-demo
+    ${{ if eq(parameters.env_type,'prod') }}:
+      value: aws-prod
+  - name: selected_pool
+    ${{ if eq(parameters.env_type,'dev') }}:
+      value: AWS-dev
+    ${{ if eq(parameters.env_type,'demo') }}:
+      value: aws-agent-demo
+    ${{ if eq(parameters.env_type,'prod') }}:
+      value: aws-agent
+    
+
+stages:
+  - stage: Validate_Setup
+    displayName: 'Validate Tools and AWS Setup for Stack ${{ parameters.Stack_Name }}'
+    condition: always() 
+    jobs:
+      - job: Validate
+        displayName: 'Run Validation Job for Stack ${{ parameters.Stack_Name }}'
+        steps:
+          - checkout: self
+            displayName: 'Checkout Repository'
+
+          - checkout: LogiBCDRFramework
+            displayName: 'Checkout Logi-BCDR-Framework Repository'
+
+          - script: |
+              echo "Checking AWS CLI version"
+              aws --version
+
+              echo "Checking Terraform version"
+              terraform --version
+            displayName: 'Check version'
+
+          - script: |
+              echo "Debugging checkout directories..."
+              
+              echo "Current working directory:"
+              pwd
+
+              echo "Listing all directories at root level:"
+              ls -alh /
+
+              echo "Listing contents of the Azure DevOps agent workspace:"
+              ls -alh /home/vsts/work/
+
+              echo "Listing contents of sources directory:"
+              ls -alh $(Build.SourcesDirectory) || echo "Sources directory does not exist"
+
+              echo "Listing the root directory of the checked-out repo:"
+              ls -alh /home/vsts/work/1/s/ || echo "/home/vsts/work/1/s/ does not exist"
+
+              echo "Listing contents of Framework repo:"
+              ls -alh /home/vsts/work/1/s/Framework/
+
+              echo "Listing contents of $(Build.SourcesDirectory)/scripts/"
+              ls -alh $(Build.SourcesDirectory)/scripts/ || echo "Scripts directory does not exist"
+            displayName: 'Debug: Check Checked-Out Files'
+
+  - stage: Upload_Scripts_to_S3
+    displayName: 'Upload Scripts to S3 Bucket'
+    condition: always() 
+    jobs:
+      - job: UploadScripts
+        displayName: 'Upload Scripts to S3 for Stack ${{ parameters.Stack_Name }}'
+        steps:
+          - task: AWSCLI@1
+            displayName: 'Upload Scripts to S3 Bucket'
+            inputs:
+              awsCredentials: '$(aws_service_connection)'  
+              regionName: 'us-west-2'
+              awsCommand: 's3'
+              awsSubCommand: 'cp'  
+              awsArguments: "$(Build.SourcesDirectory)/scripts/ s3://symphony-infra-bucket-${{ parameters.env_type }}/scripts/ --recursive"
+          - task: AWSCLI@1
+            displayName: 'Upload Values to S3 Bucket'
+            inputs:
+              awsCredentials: '$(aws_service_connection)'  
+              regionName: 'us-west-2'
+              awsCommand: 's3'
+              awsSubCommand: 'cp'  
+              awsArguments: "$(Build.SourcesDirectory)/values/ s3://abc-${{ parameters.env_type }}/values/ --recursive"
+
+  - stage: Check_Connectivity
+    displayName: 'Check Connectivity for K8s'
+    condition: always() 
+    jobs:
+      - job: CheckConnectivity
+        displayName: 'Run Check Connectivity Job for Stack ${{ parameters.Stack_Name }}'
+        steps:
+          - task: Bash@3
+            displayName: 'Check Connectivity for K8s'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} check-connectivity.sh $(stackName) $(awsRegion) $(aws_account_number) ${{ parameters.env_type }}'
+
+  - stage: deploy_backup_rds
+    displayName: 'Deploy RDS to K8s'
+    condition: eq('${{ parameters.BCDR_Component }}', 'rds')
+    jobs:
+      - job: deploy_backup_rds
+        displayName: 'Run RDS job for Stack ${{ parameters.Stack_Name }}'
+        steps:
+          - task: Bash@3
+            displayName: 'Deploy RDS to K8s'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} rds-snapshot-deploy.sh $(stackName) $(awsRegion) $(aws_account_number) ${{ parameters.snapshot_arn }}'
+
+  - stage: Import_and_Clean_Terraform_State
+    displayName: 'Import AWS DB Instance and Clean Terraform State'
+    condition: eq('${{ parameters.BCDR_Component }}', 'rds')
+    jobs:
+      - job: ImportAndClean
+        displayName: 'Import and Clean Terraform State for Stack ${{ parameters.Stack_Name }}'
+        steps:
+          - checkout: self
+          - checkout: Logi-Symphony-DevOps
+            submodules: true
+            clean: true
+            fetchDepth: 0
+          
+          - script: |
+              echo "Changing to the directory with Terraform files"
+              cd $(Build.SourcesDirectory)/Logi-Symphony-DevOps/modules/database
+              ls -alh
+              echo "Setting AWS Credentials for Terraform..."
+              export AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY)
+              export AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY)
+            
+              echo "AWS_ACCESS_KEY set to $AWS_ACCESS_KEY_ID"
+              echo "AWS_SECRET_ACCESS_KEY set to $AWS_SECRET_ACCESS_KEY"
+
+              export TF_VAR_AWS_ACCESS_KEY_ID=$(AWS_ACCESS_KEY)
+              export TF_VAR_AWS_SECRET_ACCESS_KEY=$(AWS_SECRET_ACCESS_KEY)
+
+              allocated_storage="${{ parameters.allocated_storage }}"
+              max_allocated_storage=$((allocated_storage + 100))
+
+              export TF_VAR_allocated_storage="$allocated_storage"
+              export TF_VAR_max_allocated_storage="$max_allocated_storage"
+
+              echo "Allocated Storage: $TF_VAR_allocated_storage"
+              echo "Max Allocated Storage: $TF_VAR_max_allocated_storage"
+
+              echo "Copying terraform.tfstate to terraform.tfstate.bck in S3"
+              aws s3 cp s3://abc-${{ parameters.env_type }}/${{ parameters.Stack_Name }}/database/terraform.tfstate s3://abc${{ parameters.env_type }}/${{ parameters.Stack_Name }}/db/terraform.tfstate.bck
+
+              echo "Initializing Terraform"
+              terraform init -reconfigure
+
+              echo "Importing AWS DB Instance"
+              terraform import -no-color -var "env_type=${{ parameters.env_type }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "region=${{ parameters.aws_Region }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "owner_name=${{ parameters.owner_name }}" -var "allocated_storage=${{ parameters.allocated_storage }}" aws_db_instance.default "${{ parameters.Stack_Name }}-rds"
+              terraform import -no-color -var "env_type=${{ parameters.env_type }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "region=${{ parameters.aws_Region }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "owner_name=${{ parameters.owner_name }}" aws_db_subnet_group.private_subnet_group "${{ parameters.customer_name }}-db-subnet-group"
+            
+              echo "Fetching Security Group ID for RDS"
+              security_group_id=$(aws ec2 describe-security-groups \
+                --filters "Name=group-name,Values=${{ parameters.customer_name }}-sg" \
+                --region "${{ parameters.aws_Region }}" \
+                --query "SecurityGroups[0].GroupId" --output text)
+            
+              if [ "$security_group_id" = "None" ]; then
+                echo "Error: Security Group ID not found for name '${{ parameters.customer_name }}-sg'"
+                exit 1
+              fi
+
+              terraform import -no-color -var "env_type=${{ parameters.env_type }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "region=${{ parameters.aws_Region }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "owner_name=${{ parameters.owner_name }}" aws_security_group.rds_sg "$security_group_id"              
+              terraform import -no-color -var "env_type=${{ parameters.env_type }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "region=${{ parameters.aws_Region }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "owner_name=${{ parameters.owner_name }}" aws_security_group_rule.allow_all_from_itself "$security_group_id"_ingress_-1_0_0_self
+              echo "Fetching Security Group ID for EKS Cluster"
+
+              security_group_cluster_id=$(aws ec2 describe-security-groups \
+                --filters "Name=tag:aws:eks,Values=${{ parameters.customer_name }}-cluster" \
+                --region "${{ parameters.aws_Region }}" \
+                --query "SecurityGroups[0].GroupId" --output text)
+
+              if [ "$security_group_cluster_id" = "None" ]; then
+                echo "Error: Security Group ID not found for EKS cluster with tag 'aws:eks:cluster-name=${{ parameters.customer_name }}cluster'"
+                exit 1
+              else
+                echo "Security Group ID for EKS Cluster: $security_group_cluster_id"
+              fi
+              terraform import -no-color -var "env_type=${{ parameters.env_type }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "region=${{ parameters.aws_Region }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "owner_name=${{ parameters.owner_name }}" aws_security_group_rule.eks_ingress_to_rds "${security_group_id}_ingress_tcp_5432_5432_${security_group_cluster_id}"
+
+              security_group_bastion_id=$(aws ec2 describe-security-groups \
+                --filters "Name=group-name,Values=${{ parameters.customer_name }}-bastion" \
+                --region "${{ parameters.aws_Region }}" \
+                --query "SecurityGroups[0].GroupId" --output text)
+
+              if [ "$security_group_bastion_id" = "None" ]; then
+                echo "Error: Security Group ID not found for name '${{ parameters.customer_name }}-bastion'"
+                exit 1
+              else
+                echo "Security Group ID: $security_group_bastion_id"
+              fi
+              terraform import -no-color -var "env_type=${{ parameters.env_type }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "region=${{ parameters.aws_Region }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "owner_name=${{ parameters.owner_name }}" aws_security_group_rule.jumpbox_ingress_to_rds "${security_group_bastion_id}_ingress_-1_0_0_${security_group_id}"
+              terraform import -no-color -var "env_type=${{ parameters.env_type }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "region=${{ parameters.aws_Region }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "owner_name=${{ parameters.owner_name }}" aws_security_group_rule.postgres_ingress_to_cluster "${security_group_cluster_id}_ingress_tcp_5432_5432_${security_group_id}"
+              terraform import -no-color -var "env_type=${{ parameters.env_type }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "region=${{ parameters.aws_Region }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "owner_name=${{ parameters.owner_name }}" aws_security_group_rule.rds_ingress_to_jumpbox "${security_group_id}_ingress_-1_0_0_${security_group_bastion_id}"
+            
+              echo "Running Terraform Plan to Sync State with S3 Backend" && terraform plan -out=tfplan -var "env_type=${{ parameters.env_type }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "region=${{ parameters.aws_Region }}" -var "stack_name=${{ parameters.Stack_Name }}" -var "owner_name=${{ parameters.owner_name }}"
+              echo "Running Terraform Apply to Implement Changes" && terraform apply -no-color tfplan
+            displayName: 'Import AWS DB Instance'
+
+  - stage: deploy_new_eks_cluster
+    displayName: 'Deploy new EKS'
+    condition: eq('${{ parameters.BCDR_Component }}', 'new_eks')
+    jobs:
+      - job: deploy_new_eks_cluster
+        displayName: 'Run EKS job for Stack ${{ parameters.Stack_Name }}'
+        steps:
+          - task: Bash@3
+            displayName: 'Deploy new EKS'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} create-cluster.sh $(stackName) $(awsRegion) ${{ parameters.owner_name }} ${{ parameters.env_type }} ${{ parameters.customer_name }}'
+
+  - stage: Check_Connectivity_new_EKS
+    displayName: 'Check Connectivity with new K8s'
+    condition: eq('${{ parameters.BCDR_Component }}', 'new_eks')
+    jobs:
+      - job: CheckConnectivity_new_EKS
+        displayName: 'Run Check Connectivity Job for Stack ${{ parameters.Stack_Name }}'
+        steps:
+          - task: Bash@3
+            displayName: 'Check Connectivity for new K8s'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} check-connectivity.sh $(stackName) $(awsRegion) $(aws_account_number) ${{ parameters.env_type }}'
+
+  - stage: Deploy_Add_ons
+    displayName: 'Deploy Add_ons on new K8s'
+    condition: eq('${{ parameters.BCDR_Component }}', 'new_eks')
+    jobs:
+      - job: Deploy_Add_ons
+        displayName: 'Deploy Add_ons on K8s'
+        steps:
+          - task: Bash@3
+            displayName: 'Deploy Add_ons on new K8s'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} eks_setup_with_addons.sh $(stackName) $(awsRegion) $(aws_account_number)'
+
+  - stage: Deploy_Storage_class
+    displayName: 'Deploy Storage_class on new K8s'
+    condition: eq('${{ parameters.BCDR_Component }}', 'new_eks')
+    jobs:
+      - job: Deploy_Storage_class
+        displayName: 'Deploy Storage_class on K8s'
+        steps:
+          - task: Bash@3
+            displayName: 'Deploy Storage_class on new K8s'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} eks-storageclass-config.sh $(stackName)'
+ 
+  - stage: Deploy_ALB_controller
+    displayName: 'Deploy ALB on new K8s'
+    condition: eq('${{ parameters.BCDR_Component }}', 'new_eks')
+    jobs:
+      - job: Deploy_ALB_controller
+        displayName: 'Deploy ALB on new K8s Job'
+        steps:
+          - task: Bash@3
+            displayName: 'Deploy ALB on new K8s'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} alb-deployment-new-cluster.sh $(stackName) $(awsRegion) $(aws_account_number) ${{ parameters.env_type }}'
+
+  - stage: Uninstall_Application_on_old_K8s
+    displayName: 'Uninstall App on old K8s'
+    condition: eq('${{ parameters.BCDR_Component }}', 'old_eks')
+    jobs:
+      - job: Uninstall_Application_on_old_K8s
+        displayName: 'Uninstall Application for old K8s'
+        steps:
+          - task: Bash@3
+            displayName: 'Uninstall App on old K8s'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} application-deploy.sh $(awsRegion) ${{ parameters.customer_name }} $(helm_chart_repo_url) uninstall ${{ parameters.env_type }} $(helm_chart_version)'
+
+  - stage: Delete_the_old_pv_and_pvc
+    displayName: 'Delete the old pv and pvc'
+    condition: eq('${{ parameters.BCDR_Component }}', 'old_eks')
+    jobs:
+      - job: Delete_the_old_pv_and_pvc
+        displayName: 'Delete_the_old_pv_and_pvc Job'
+        steps:
+          - task: Bash@3
+            displayName: 'Delete the old pv and pvc'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} delete_pv_pvc.sh ${{ parameters.customer_name }} ${{ parameters.customer_name }}'
+
+  - stage: Deploy_Application_on_K8s_on_old_EKS
+    displayName: 'Deploy Application on old K8s'
+    condition: eq('${{ parameters.BCDR_Component }}', 'old_eks')
+    jobs:
+      - job: Deploy_Application_on_K8s_on_old_EKS
+        displayName: 'Deploy Application on new K8s Job'
+        steps:
+          - task: Bash@3
+            displayName: 'Deploy Application on old K8s'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} application-deploy.sh $(awsRegion) ${{ parameters.customer_name }} $(helm_chart_repo_url) install ${{ parameters.env_type }} $(helm_chart_version)'
+
+  - stage: Deploy_Application_on_K8s_on_new_EKS
+    displayName: 'Deploy Application on new K8s'
+    condition: eq('${{ parameters.BCDR_Component }}', 'new_eks')
+    jobs:
+      - job: Deploy_Application_on_K8s_on_new_EKS
+        displayName: 'Deploy Application on new K8s Job'
+        steps:
+          - task: Bash@3
+            displayName: 'Deploy Application on new K8s'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} application-deploy.sh $(awsRegion) ${{ parameters.customer_name }} $(helm_chart_repo_url) install ${{ parameters.env_type }} $(helm_chart_version)'
+
+  - stage: Cleanup_PV_from_K8s
+    displayName: 'Cleanup PV from K8s'
+    condition: or(eq('${{ parameters.BCDR_Component }}', 'new_eks'), eq('${{ parameters.BCDR_Component }}', 'old_eks'))
+    jobs:
+      - job: Cleanup_PV_from_K8s
+        displayName: 'Cleanup PV from K8s to restore'
+        steps:
+          - task: Bash@3
+            displayName: 'Cleanup PV from K8s'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} pv-cleanup.sh ${{ parameters.customer_name }} ${{ parameters.customer_name }}'
+
+  - stage: Restore_Application_on_K8s
+    displayName: 'Restore Application on K8s'
+    condition: or(eq('${{ parameters.BCDR_Component }}', 'new_eks'), eq('${{ parameters.BCDR_Component }}', 'old_eks'))
+    jobs:
+      - job: Restore_Application_on_K8s
+        displayName: 'Restore Application on K8s cluster'
+        steps:
+          - task: Bash@3
+            displayName: 'Restore Application on K8s'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} pv-pvc-restore.sh ${{ parameters.customer_name }} ${{ parameters.customer_name }} $(awsRegion)'
+  
+  - stage: Apply_Snapshot_creation_on_restore_K8s
+    displayName: 'Apply Snapshot creation on restore cluster'
+    condition: eq('${{ parameters.BCDR_Component }}', 'new_eks')
+    jobs:
+      - job: Apply_Snapshot_creation_on_restore_K8s
+        displayName: 'Apply Snapshot creation on restore cluster Job'
+        steps:
+          - task: Bash@3
+            displayName: 'Apply Snapshot creation on restore cluster'
+            inputs:
+              targetType: 'filepath'
+              filepath: '$(Build.SourcesDirectory)/scripts/run-command.sh'
+              arguments: '${{ parameters.env_type }} $(awsRegion) $(AWS_ACCESS_KEY) $(AWS_SECRET_ACCESS_KEY) $(stackName) ${{ parameters.customer_name }} add-snapshot-tags-and-dlm.sh ${{ parameters.Stack_Name }} true $(awsRegion) $(aws_account_number)'
+  
+  - stage: CleanWorkspace
+    displayName: 'Clean Workspace'
+    condition: always() 
+    jobs:
+    - job: clean_workspace
+      displayName: 'Clean Workspace'
+      steps:
+        - checkout: none
+
+        - script: |
+            echo "Cleaning temp and build directories..."
+            rm -rf $(Agent.TempDirectory)/*
+            rm -rf $(Agent.BuildDirectory)/*
+            echo "Cleanup complete."
+          displayName: 'Cleanup Temp & Build Directories'
